@@ -232,8 +232,324 @@
 			  } 
 	* 2.3
 		
-			$ MultipartBody.java  //compliant request body 即 兼容请求体
+			// 开始请求吧，just do it
+			okHttpClient.newCall(request).enqueue(this)
+			$ OkHttpClient.java 
+			@Override public Call newCall(Request request) { // 可见 交给RealCall去处理
+				// 第一个参数 this 把自己传给了 RealCall
+			    return RealCall.newRealCall(this, request, false  /* for web socket 最后一个参数验证是否是webSocket*/);
+			  }
+
+			$ ReallCall.java
+			  @Override public void enqueue(Callback responseCallback) {
+			    synchronized (this) { //对象锁 ，当前的call是否在执行。如果你重复执行那么抛出异常
+			      if (executed) throw new IllegalStateException("Already Executed");
+			      executed = true; 
+			    }
+			    transmitter.callStart();
+				//调用 $Dispatcher.java 的enqueue(AsyncCall asyncCall)
+				// 带上AsyncCall 进入到DisPatcher中
+			    client.dispatcher().enqueue(new AsyncCall(responseCallback));//这个AsyncCall是个什么鬼？让我们来一探究竟
+			  }
+			$ AsyncCall.java 一看原来是RealCall中的内部类
+			  final class AsyncCall extends NamedRunnable { //继承自这个NamedRunnable的Runnable接口
+			    private final Callback responseCallback;
+			    private volatile AtomicInteger callsPerHost = new AtomicInteger(0);
 			
+			    AsyncCall(Callback responseCallback) {
+			      super("OkHttp %s", redactedUrl());
+			      this.responseCallback = responseCallback;
+			    }
+			
+			    AtomicInteger callsPerHost() {
+			      return callsPerHost;
+			    }
+			
+			    void reuseCallsPerHostFrom(AsyncCall other) {
+			      this.callsPerHost = other.callsPerHost;
+			    }
+			
+			    String host() {
+			      return originalRequest.url().host();
+			    }
+			
+			    Request request() {
+			      return originalRequest;
+			    }
+			
+			    RealCall get() {
+			      return RealCall.this;
+			    }
+
+		    /**
+		     * Attempt to enqueue this async call on {@code executorService}. This will attempt to clean up
+		     * if the executor has been shut down by reporting the call as failed.
+		     */
+		    void executeOn(ExecutorService executorService) {
+		      assert (!Thread.holdsLock(client.dispatcher()));
+		      boolean success = false;
+		      try {
+		        executorService.execute(this);
+		        success = true;
+		      } catch (RejectedExecutionException e) {
+		        InterruptedIOException ioException = new InterruptedIOException("executor rejected");
+		        ioException.initCause(e);
+		        transmitter.noMoreExchanges(ioException);
+		        responseCallback.onFailure(RealCall.this, ioException);
+		      } finally {
+		        if (!success) {
+		          client.dispatcher().finished(this); // This call is no longer running!
+		        }
+		      }
+		    }
+		
+		    @Override protected void execute() { //详情请见下方
+		      boolean signalledCallback = false;
+		      transmitter.timeoutEnter();
+		      try {
+		        Response response = getResponseWithInterceptorChain();
+		        signalledCallback = true;
+		        responseCallback.onResponse(RealCall.this, response);
+		      } catch (IOException e) {
+		        if (signalledCallback) {
+		          // Do not signal the callback twice!
+		          Platform.get().log(INFO, "Callback failure for " + toLoggableString(), e);
+		        } else {
+		          responseCallback.onFailure(RealCall.this, e);
+		        }
+		      } finally {
+		        client.dispatcher().finished(this);
+		      }
+		    }
+		 	 }
+
+		---
+			 $NamedRunnable.java 
+			//抽象的接口 ， 原来也是sh自 Runnable
+			public abstract class NamedRunnable implements Runnable {
+			  protected final String name;
+			
+			  public NamedRunnable(String format, Object... args) {
+			    this.name = Util.format(format, args);
+			  }
+			
+			  @Override public final void run() {
+			    String oldName = Thread.currentThread().getName();
+			    Thread.currentThread().setName(name); //设置一下线程名
+			    try {
+			      execute(); //执行网络请求的时候，线程池执行这个run，
+			    } finally {
+			      Thread.currentThread().setName(oldName); //线程 名设置回来
+			    }
+			  }
+			
+			  protected abstract void execute(); // 干的漂亮！！好一个模板设计模式
+			}
+					
+		---
+			$Dispatcher.java
+			  void enqueue(AsyncCall call) {
+			    synchronized (this) { //加对象锁，保证安全
+			      readyAsyncCalls.add(call); //将这个AsyncCall加入ReadyAsyncCalls集合当中
+			
+			      // Mutate the AsyncCall so that it shares the AtomicInteger of an existing running call to
+			      // the same host.
+			      if (!call.get().forWebSocket) { //这位兄台，你不是webSocket吧
+			        AsyncCall existingCall = findExistingCallWithHost(call.host()); //是否已经存在这个url
+			        if (existingCall != null) call.reuseCallsPerHostFrom(existingCall);
+			      }
+			    }
+			    promoteAndExecute();
+			  }
+			
+			  private boolean promoteAndExecute() {
+			    assert (!Thread.holdsLock(this));
+			
+			    List<AsyncCall> executableCalls = new ArrayList<>();
+			    boolean isRunning;
+			    synchronized (this) {
+			      for (Iterator<AsyncCall> i = readyAsyncCalls.iterator(); i.hasNext(); ) {
+			        AsyncCall asyncCall = i.next();
+					//请求数量超标，直接break  进入下面的环节
+			        if (runningAsyncCalls.size() >= maxRequests) break; // Max capacity.
+					//同一个请求达到最大请求数 ，跳过当前的这个url,continue到下一个
+			        if (asyncCall.callsPerHost().get() >= maxRequestsPerHost) continue; // Host max capacity.
+			
+			        i.remove(); // 从 readyAsyncCalls 中移除
+					// 一个请求对应一个AsyncCall,增加当前这个请求的计数
+			        asyncCall.callsPerHost().incrementAndGet();
+					//将readyAsyncCalls 加入到executableCalls和runningAsyncCalls中
+			        executableCalls.add(asyncCall);
+			        runningAsyncCalls.add(asyncCall);
+			      }
+			      isRunning = runningCallsCount() > 0;
+			    }
+				//ok,一切就绪
+			    for (int i = 0, size = executableCalls.size(); i < size; i++) {
+			      AsyncCall asyncCall = executableCalls.get(i);
+				//!! 全国人民 注意啦，带着统一的ExecutorService回到AsyncTask的内部去执行起来吧。
+			      asyncCall.executeOn(executorService());
+			    }
+			    return isRunning;
+			  }
+				//获取DisPatcher中的ExecutorService
+				  public synchronized ExecutorService executorService() {
+				    if (executorService == null) {
+				      executorService = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 60, TimeUnit.SECONDS,
+				          new SynchronousQueue<>(), Util.threadFactory("OkHttp Dispatcher", false));
+				    }
+				    return executorService;
+		  }
+
+		---
+		 * ok回到AsyncCall,是时候表演真正的技术了
+		
+				/**
+			     * Attempt to enqueue this async call on {@code executorService}. This will attempt to clean up
+			     * if the executor has been shut down by reporting the call as failed.
+			     */
+			    void executeOn(ExecutorService executorService) {
+			      assert (!Thread.holdsLock(client.dispatcher())); //未持有当前线程的对象锁，给我继续！否则~~Exception伺候
+			      boolean success = false;
+			      try {
+					//她来了~ 她来了~ 她带着任务来了
+			        executorService.execute(this); //传入this,是因为这个AsyncCall继承了NamedRunnable也就是一个Runnable
+			        success = true;
+			      } catch (RejectedExecutionException e) { //请求太多了，线程池大哥已经废了，但是目前看不可能出现这个异常的
+			        InterruptedIOException ioException = new InterruptedIOException("executor rejected");
+			        ioException.initCause(e);
+			        transmitter.noMoreExchanges(ioException);
+			        responseCallback.onFailure(RealCall.this, ioException);
+			      } finally {
+			        if (!success) {
+			          client.dispatcher().finished(this); // This call is no longer running!
+			        }
+			      }
+			    }	
+				//上方的execotorService一旦执行起来，这个写在run中的抽象execute()方法即在线程池中执行起来
+			    @Override protected void execute() {
+			      boolean signalledCallback = false;
+			      transmitter.timeoutEnter();//看门狗，超时判断 这个是什么东西。
+			      try {
+			        Response response = getResponseWithInterceptorChain(); //来了 来了 她带着Response和Interceptor来了
+			        signalledCallback = true;
+			        responseCallback.onResponse(RealCall.this, response);
+			      } catch (IOException e) {
+			        if (signalledCallback) {
+			          // Do not signal the callback twice!
+			          Platform.get().log(INFO, "Callback failure for " + toLoggableString(), e);
+			        } else {
+			          responseCallback.onFailure(RealCall.this, e);
+			        }
+			      } finally {
+			        client.dispatcher().finished(this);
+			      }
+			    }
+			 	 }	
+
+---
+
+### 来了，来了，她脚踩五彩祥云，确认过眼神是个盖世英雄，带着拦截器来了~~~
+---
+	
+
+			* RealCall.java
+
+					//getResponseWithInterceptorChain这也是RealCall中的最后一个方法，我想应该也是有某些意思吧。
+					  Response getResponseWithInterceptorChain() throws IOException {
+				    // Build a full stack of interceptors.
+				    List<Interceptor> interceptors = new ArrayList<>();
+					//先把用户在OkHttpClient中添加进去的拦截器 弄进去
+				    interceptors.addAll(client.interceptors()); 
+					// RetryAndFollowUpInterceptor 拦截器  --> 1
+				    interceptors.add(new RetryAndFollowUpInterceptor(client));
+					// BridgeInterceptor 拦截器            --> 2
+				    interceptors.add(new BridgeInterceptor(client.cookieJar()));
+					// CacheInterceptor 拦截器			   --> 3
+				    interceptors.add(new CacheInterceptor(client.internalCache()));
+					// ConnectInterceptor 拦截器 		   --> 4
+				    interceptors.add(new ConnectInterceptor(client));
+				    if (!forWebSocket) { //是webSocket的话就别加这个 networkInterceptors 拦截器 --> 5
+				      interceptors.addAll(client.networkInterceptors());
+				    }
+					// CallServerInterceptor 拦截器  -->  6
+				    interceptors.add(new CallServerInterceptor(forWebSocket));
+					// RealInterceptorChain 拦截器 
+				    Interceptor.Chain chain = new RealInterceptorChain(interceptors, transmitter, null, 0,
+				        originalRequest, this, client.connectTimeoutMillis(),
+				        client.readTimeoutMillis(), client.writeTimeoutMillis());
+				
+				    boolean calledNoMoreExchanges = false;
+				    try {
+						// RealInterceptorChain 带着 originalRequest 来了 
+				      Response response = chain.proceed(originalRequest); //ok , 我们到RealInterceptorChain中看一看proceed方法
+				      if (transmitter.isCanceled()) {
+				        closeQuietly(response);
+				        throw new IOException("Canceled");
+				      }
+				      return response;
+				    } catch (IOException e) {
+				      calledNoMoreExchanges = true;
+				      throw transmitter.noMoreExchanges(e);
+				    } finally {
+				      if (!calledNoMoreExchanges) {
+				        transmitter.noMoreExchanges(null);
+				      }
+				    }
+				 	 }
+
+	 $ RealInterceptorChain.java
+
+		@Override public Response proceed(Request request) throws IOException {
+	    return proceed(request, transmitter, exchange);
+	  }
+	
+	  public Response proceed(Request request, Transmitter transmitter, @Nullable Exchange exchange)
+	      throws IOException {
+	    if (index >= interceptors.size()) throw new AssertionError();
+	
+	    calls++;
+	
+	    // If we already have a stream, confirm that the incoming request will use it.
+	    if (this.exchange != null && !this.exchange.connection().supportsUrl(request.url())) {
+	      throw new IllegalStateException("network interceptor " + interceptors.get(index - 1)
+	          + " must retain the same host and port");
+	    }
+	
+	    // If we already have a stream, confirm that this is the only call to chain.proceed().
+	    if (this.exchange != null && calls > 1) {
+	      throw new IllegalStateException("network interceptor " + interceptors.get(index - 1)
+	          + " must call proceed() exactly once");
+	    }
+		// 调用下一个拦截器
+	    // Call the next interceptor in the chain.
+		//封装了这个RealInterceptorChain index从0 --> 1 
+	    RealInterceptorChain next = new RealInterceptorChain(interceptors, transmitter, exchange,
+	        index + 1, request, call, connectTimeout, readTimeout, writeTimeout);
+		
+	    Interceptor interceptor = interceptors.get(index); //集合中取第1个，用户的拦截器，假定用户没有传入拦截器，那么第一个为RetryAndFollowUpInterceptor这个拦截器
+	    Response response = interceptor.intercept(next); // 包裹着这个RealInterceptorChain 我进入RetryAndFollowUpInterceptor取看这个inercept(Chin)
+	
+	    // Confirm that the next interceptor made its required call to chain.proceed().
+	    if (exchange != null && index + 1 < interceptors.size() && next.calls != 1) {
+	      throw new IllegalStateException("network interceptor " + interceptor
+	          + " must call proceed() exactly once");
+	    }
+	
+	    // Confirm that the intercepted response isn't null.
+	    if (response == null) {
+	      throw new NullPointerException("interceptor " + interceptor + " returned null");
+	    }
+	
+	    if (response.body() == null) {
+	      throw new IllegalStateException(
+	          "interceptor " + interceptor + " returned a response with no body");
+	    }
+	
+	    return response;
+	  }
+
+
 		
 			
 			
