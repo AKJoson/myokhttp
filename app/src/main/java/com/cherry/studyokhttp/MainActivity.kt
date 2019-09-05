@@ -36,17 +36,18 @@ class MainActivity : AppCompatActivity() ,Callback{
 
         val requestBody:RequestBody = RequestBody.create(mediaType,json)
 
-        val request:Request = Request.Builder()
-            .url("http://132.232.23.157:5000/getbooks")
-            .post(requestBody)
-            .build()
+//        val request:Request = Request.Builder()
+//            .url(".....")
+//            .post(requestBody)
+//            .build()
 
         button.setOnClickListener {
             run {
                 Log.e("TAG", "---")
-                okHttpClient.newCall(request).enqueue(this)
+//                okHttpClient.newCall(request).enqueue(this)
             }
         }
+        Client().startControl()
     }
 
     override fun onFailure(call: Call, e: IOException) {
