@@ -45,6 +45,7 @@ class MainActivity : AppCompatActivity() ,Callback{
             run {
                 Log.e("TAG", "---")
 //                okHttpClient.newCall(request).enqueue(this)
+//                okHttpClient.newCall(request).execute()
             }
         }
         Client().startControl()
